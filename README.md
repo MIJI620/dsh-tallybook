@@ -24,7 +24,8 @@
 插件是标准的 DSH bundle，本地目录即可安装：
 
 1. 在 DSH 的「设置 → 插件 → 插件列表」里选择本地目录安装；或
-2. 用命令行：`dsh plugin --profile <你的 profile> add link:<本目录绝对路径>`。
+2. 用命令行：`dsh plugin --profile <你的 profile> add link:<本目录绝对路径>`；或
+3. 直接从仓库安装：`dsh plugin --profile <你的 profile> add github:MIJI620/dsh-tallybook`。
 
 装完重启 DSH，左侧栏就会出现入口。需要先在 DSH 里登录 DeepSeek 账号，否则面板会提示未登录。
 
