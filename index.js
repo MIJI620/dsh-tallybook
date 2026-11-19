@@ -16,6 +16,7 @@
  *
  * @module dsh-deepseek-usage-stats
  */
+import { execFile } from 'node:child_process'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -28,6 +29,69 @@ export const inject = ['deepseekAccount', 'webServer']
 
 /** Snapshot route; the browser half builds the same constant. */
 const ROUTE = '/api/deepseek-usage/data'
+
+/** Route that writes a generated report PNG to the plugin's reports folder. */
+const REPORT_ROUTE = '/api/deepseek-usage/save-report'
+
+/** Route that opens the native folder picker. */
+const PICK_ROUTE = '/api/deepseek-usage/pick-folder'
+
+/** Cached native dialog lookup: the desktop shell exposes Electron, other shells do not. */
+let dialogPromise = null
+
+/**
+ * Resolve Electron's dialog module when the Host runs inside the desktop shell.
+ * @returns the dialog object, or null when unavailable.
+ */
+function loadDialog() {
+  if (dialogPromise === null) {
+    dialogPromise = import('electron')
+      .then(module => module.dialog ?? module.default?.dialog ?? null)
+      .catch(() => null)
+  }
+  return dialogPromise
+}
+
+/**
+ * Whether a string is an absolute path this Host can write to.
+ * @param value - candidate path.
+ * @returns whether it looks absolute.
+ */
+function isAbsolutePath(value) {
+  return typeof value === 'string' && (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith('/'))
+}
+
+/**
+ * Open the Windows folder picker through PowerShell, used when the desktop shell
+ * does not expose Electron's dialog to plugins.
+ * @returns the chosen folder, or null when cancelled or unavailable.
+ */
+function pickFolderWithPowerShell() {
+  return new Promise((resolve) => {
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms',
+      '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
+      "$dialog.Description = '选择报告保存位置'",
+      'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) } else { [Console]::Out.Write("CANCELED") }',
+    ].join('; ')
+    execFile('powershell.exe', ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { timeout: 180000, windowsHide: true },
+      (error, stdout) => {
+        const value = String(stdout ?? '').trim()
+        if (error !== null || value === '' || value === 'CANCELED') {
+          resolve(null)
+          return
+        }
+        resolve(value)
+      })
+  })
+}
+
+/** Per-API-key token endpoint (the console's "by API" view). */
+const BY_KEY_AMOUNT_PATH = '/api/v0/usage/by_api_key/amount'
+
+/** Per-API-key cost endpoint. */
+const BY_KEY_COST_PATH = '/api/v0/usage/by_api_key/cost'
 
 /** One Platform request's deadline. */
 const REQUEST_TIMEOUT_MS = 20000
@@ -311,6 +375,123 @@ function buildDailySeries(months) {
 }
 
 /**
+ * Convert one month into the timestamp window the per-key endpoints expect.
+ * The month is cut on UTC boundaries: the console's own `usage/amount` rows are
+ * UTC days too, so both sources place the same day in the same month.
+ * @param year - four-digit year.
+ * @param month - 1-based month.
+ * @returns start/end seconds and a zero offset.
+ */
+function monthWindow(year, month) {
+  return {
+    startSec: Date.UTC(year, month - 1, 1) / 1000,
+    endSec: Date.UTC(year, month, 1) / 1000,
+    tzSec: 0,
+  }
+}
+
+/**
+ * Render a bucket timestamp as the local date it belongs to.
+ * @param timeSec - bucket start in seconds.
+ * @param tzSec - local offset in seconds.
+ * @returns `YYYY-MM-DD`.
+ */
+function bucketDate(timeSec, tzSec) {
+  const date = new Date((timeSec + tzSec) * 1000)
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`
+}
+
+/**
+ * Collect per-model and per-API-key daily series for the recorded months.
+ * The console exposes both dimensions through `/usage/by_api_key/*`, whose
+ * series carry the key identity and the model of every bucket.
+ * @param session - the account's Platform session.
+ * @param months - ascending months to cover.
+ * @returns models and keys, each a list of groups with their daily rows.
+ */
+async function collectGroups(session, months) {
+  const rows = new Map()
+  const rowOf = (trackingId, name, model, date) => {
+    const id = `${trackingId}|${model}|${date}`
+    let row = rows.get(id)
+    if (row === undefined) {
+      row = { trackingId, name, model, date, cost: 0, cacheHit: 0, cacheMiss: 0, response: 0, requests: 0 }
+      rows.set(id, row)
+    }
+    return row
+  }
+  for (const month of months) {
+    const { startSec, endSec, tzSec } = monthWindow(month.year, month.month)
+    const query = `start=${startSec}&end=${endSec}&tz=${tzSec}`
+    const [amountBiz, costBiz] = await Promise.all([
+      platformGet(session, `${BY_KEY_AMOUNT_PATH}?${query}`),
+      platformGet(session, `${BY_KEY_COST_PATH}?${query}`),
+    ])
+    for (const item of amountBiz?.series ?? []) {
+      const apiKey = item.api_key ?? {}
+      const trackingId = typeof apiKey.tracking_id === 'string' ? apiKey.tracking_id : ''
+      const name = typeof apiKey.name === 'string' && apiKey.name !== '' ? apiKey.name : trackingId
+      const model = typeof item.model === 'string' ? item.model : ''
+      for (const bucket of item.buckets ?? []) {
+        const row = rowOf(trackingId, name, model, bucketDate(bucket.time, tzSec))
+        const usage = bucket.usage ?? {}
+        row.cacheHit += toNumber(usage.PROMPT_CACHE_HIT_TOKEN)
+        row.cacheMiss += toNumber(usage.PROMPT_CACHE_MISS_TOKEN)
+        row.response += toNumber(usage.RESPONSE_TOKEN)
+        row.requests += toNumber(usage.REQUEST)
+      }
+    }
+    for (const item of costBiz?.data?.[0]?.series ?? []) {
+      const apiKey = item.api_key ?? {}
+      const trackingId = typeof apiKey.tracking_id === 'string' ? apiKey.tracking_id : ''
+      const name = typeof apiKey.name === 'string' && apiKey.name !== '' ? apiKey.name : trackingId
+      const model = typeof item.model === 'string' ? item.model : ''
+      for (const bucket of item.buckets ?? []) {
+        rowOf(trackingId, name, model, bucketDate(bucket.time, tzSec)).cost += toNumber(bucket.cost)
+      }
+    }
+  }
+
+  const addDay = (days, row) => {
+    let day = days.get(row.date)
+    if (day === undefined) {
+      day = { date: row.date, cost: 0, cacheHit: 0, cacheMiss: 0, response: 0, requests: 0 }
+      days.set(row.date, day)
+    }
+    day.cost += row.cost
+    day.cacheHit += row.cacheHit
+    day.cacheMiss += row.cacheMiss
+    day.response += row.response
+    day.requests += row.requests
+  }
+  const byModel = new Map()
+  const byKey = new Map()
+  for (const row of rows.values()) {
+    if (row.model !== '') {
+      if (!byModel.has(row.model)) byModel.set(row.model, new Map())
+      addDay(byModel.get(row.model), row)
+    }
+    if (row.trackingId !== '') {
+      let entry = byKey.get(row.trackingId)
+      if (entry === undefined) {
+        entry = { trackingId: row.trackingId, name: row.name, days: new Map() }
+        byKey.set(row.trackingId, entry)
+      }
+      addDay(entry.days, row)
+    }
+  }
+  const sorted = (days) => [...days.values()].sort((left, right) => left.date.localeCompare(right.date))
+  return {
+    models: [...byModel].map(([name, days]) => ({ name, daily: sorted(days) })),
+    keys: [...byKey.values()].map(entry => ({
+      trackingId: entry.trackingId,
+      name: entry.name,
+      daily: sorted(entry.days),
+    })),
+  }
+}
+
+/**
  * Build one snapshot: lifetime spend, per-month summaries, and the daily series.
  * @param session - the account's Platform session.
  * @returns the snapshot body without the route envelope.
@@ -326,6 +507,13 @@ async function buildSnapshot(session) {
   const dailyTotal = daily.reduce((sum, day) => sum + day.cost, 0)
   const lifetimeSpend = lifetime === null ? dailyTotal : lifetime.amount
   const monthsWithSpend = months.filter(month => month.totals.cost > 0).length
+  // Group data is a bonus view: a failure there must not sink the main snapshot.
+  let groups = { models: [], keys: [] }
+  try {
+    groups = await collectGroups(session, months)
+  } catch {
+    // Keep the ungrouped snapshot usable when the per-key endpoint misbehaves.
+  }
   return {
     ok: true,
     currency: lifetime === null ? 'CNY' : lifetime.currency,
@@ -350,6 +538,7 @@ async function buildSnapshot(session) {
       activeDays: month.activeDays,
     })),
     daily,
+    groups,
     generatedAt: new Date().toISOString(),
   }
 }
@@ -372,7 +561,8 @@ function readStoredSnapshot() {
   if (path === null) return null
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'))
-    return parsed !== null && typeof parsed === 'object' && parsed.ok === true ? parsed : null
+    const usable = parsed !== null && typeof parsed === 'object' && parsed.ok === true && parsed.groups !== undefined
+    return usable ? parsed : null
   } catch {
     return null
   }
@@ -449,6 +639,36 @@ async function rebuild(account, cache) {
 }
 
 /**
+ * Read and parse a JSON request body.
+ * @param req - the incoming request.
+ * @param limit - maximum accepted body size in bytes.
+ * @returns the parsed body.
+ */
+function readJsonBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > limit) {
+        reject(new Error('body-too-large'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+      } catch (error) {
+        reject(error)
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+/**
  * Register the snapshot route.
  * @param ctx - the Host plugin context.
  */
@@ -473,4 +693,82 @@ export function apply(ctx) {
       sendJson(res, answer.status, answer.body)
     },
   }), 'deepseek-usage-stats: data route')
+
+  // Reports are written by the Host: a browser folder picker is not available in
+  // this shell, and this way the browser never needs a save dialog at all.
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: REPORT_ROUTE,
+    handler: async (req, res) => {
+      if (!isLoopback(req)) {
+        sendJson(res, 403, { ok: false, code: 'loopback-only' })
+        return
+      }
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, code: 'post-only' })
+        return
+      }
+      let payload
+      try {
+        payload = await readJsonBody(req, 64 * 1024 * 1024)
+      } catch {
+        sendJson(res, 400, { ok: false, code: 'bad-body' })
+        return
+      }
+      const name = typeof payload?.name === 'string' ? payload.name : ''
+      const dataUrl = typeof payload?.dataUrl === 'string' ? payload.dataUrl : ''
+      if (!/^[A-Za-z0-9._-]{1,120}\.png$/.test(name)) {
+        sendJson(res, 400, { ok: false, code: 'bad-name' })
+        return
+      }
+      const prefix = 'data:image/png;base64,'
+      if (!dataUrl.startsWith(prefix)) {
+        sendJson(res, 400, { ok: false, code: 'bad-data' })
+        return
+      }
+      try {
+        const requested = typeof payload?.directory === 'string' ? payload.directory : ''
+        const directory = isAbsolutePath(requested) ? requested : join(dirname(cacheFilePath()), 'reports')
+        mkdirSync(directory, { recursive: true })
+        const target = join(directory, name)
+        writeFileSync(target, Buffer.from(dataUrl.slice(prefix.length), 'base64'))
+        sendJson(res, 200, { ok: true, path: target })
+      } catch (error) {
+        sendJson(res, 500, { ok: false, code: 'write-failed', message: String(error?.message ?? error) })
+      }
+    },
+  }), 'deepseek-usage-stats: report route')
+
+  // The native picker runs in the Host process: the browser half has no access to
+  // one here, and this also lets the user choose where reports land.
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: PICK_ROUTE,
+    handler: async (req, res) => {
+      if (!isLoopback(req)) {
+        sendJson(res, 403, { ok: false, code: 'loopback-only' })
+        return
+      }
+      const dialog = await loadDialog()
+      if (dialog !== null && typeof dialog.showOpenDialog === 'function') {
+        try {
+          const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
+          if (result.canceled || result.filePaths.length === 0) {
+            sendJson(res, 200, { ok: false, code: 'canceled' })
+            return
+          }
+          sendJson(res, 200, { ok: true, path: result.filePaths[0] })
+        } catch (error) {
+          sendJson(res, 200, { ok: false, code: 'picker-failed', message: String(error?.message ?? error) })
+        }
+        return
+      }
+      const picked = await pickFolderWithPowerShell()
+      if (picked === null) {
+        sendJson(res, 200, { ok: false, code: 'canceled' })
+        return
+      }
+      sendJson(res, 200, { ok: true, path: picked })
+    },
+  }), 'deepseek-usage-stats: folder picker')
 }
