@@ -5,6 +5,11 @@
   "type": "module",
   "description": "A DeepSeek usage panel for the DSH Web GUI: daily spend and token curves, monthly and yearly totals with growth rates, and exportable daily details.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MIJI620/dsh-tallybook.git"
+  },
+  "homepage": "https://github.com/MIJI620/dsh-tallybook",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
