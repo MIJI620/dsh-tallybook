@@ -1,0 +1,6 @@
+# dsh-tallybook
+# Host half serves /api/deepseek-usage from the signed-in DeepSeek account;
+# the Client half adds the sidebar entry and the statistics page it opens.
+- insert:
+    - id: tallybook
+      name: dsh-tallybook

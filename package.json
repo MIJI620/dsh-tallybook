@@ -1,0 +1,30 @@
+{
+  "name": "dsh-tallybook",
+  "version": "0.2.2-rc.5",
+  "private": true,
+  "type": "module",
+  "description": "A DeepSeek usage panel for the DSH Web GUI: daily spend and token curves, monthly and yearly totals with growth rates, and exportable daily details.",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-locale"]
+    }
+  }
+}

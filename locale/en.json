@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DeepSeek usage tally",
+    "description": "Adds a Usage entry to the sidebar with daily spend curves, daily token composition (cache hits, cache misses, output), monthly and yearly totals with growth rates, and copy/CSV export of the daily detail. The Host reads the signed-in DeepSeek account from platform.deepseek.com; the account token never leaves the machine and the browser only receives aggregated numbers. Snapshots are cached locally and refreshed in the background."
+  }
+}
