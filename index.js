@@ -304,6 +304,8 @@ function previousMonth(year, month) {
  */
 async function collectMonths(session) {
   const collected = []
+  // The console shows every date in the viewer's own zone, so the walk starts
+  // from the local month and each month window follows the same offset.
   const now = new Date()
   let cursor = { year: now.getFullYear(), month: now.getMonth() + 1 }
   let emptyRun = 0
@@ -344,7 +346,7 @@ function formatDateKey(timestamp) {
 }
 
 /**
- * Today's date key in the Host's own time zone.
+ * Today's date key in the Host's own time zone, matching the console's calendar.
  * @returns the date key.
  */
 function todayKey() {
@@ -354,16 +356,14 @@ function todayKey() {
 
 /**
  * Build the continuous daily series the charts draw, filling idle days with zeros.
- * @param months - ascending months with their day maps.
+ * @param days - the recorded days, already cut on local midnights.
+ * @param firstMonthKey - the first month to show, as `YYYY-MM`.
  * @returns ascending days from the first recorded month to today.
  */
-function buildDailySeries(months) {
-  if (months.length === 0) return []
-  const byDate = new Map()
-  for (const month of months) {
-    for (const day of month.days) byDate.set(day.date, day)
-  }
-  const start = parseDateKey(`${months[0].key}-01`)
+function buildDailySeries(days, firstMonthKey) {
+  if (days.length === 0) return []
+  const byDate = new Map(days.map(day => [day.date, day]))
+  const start = parseDateKey(`${firstMonthKey}-01`)
   const end = parseDateKey(todayKey())
   const series = []
   for (let cursor = start; cursor <= end; cursor += 24 * 60 * 60 * 1000) {
@@ -375,18 +375,54 @@ function buildDailySeries(months) {
 }
 
 /**
+ * Fold the daily series into per-month summaries.
+ * @param days - ascending days.
+ * @returns ascending months with their totals.
+ */
+function aggregateMonths(days) {
+  const byKey = new Map()
+  for (const day of days) {
+    const key = day.date.slice(0, 7)
+    let entry = byKey.get(key)
+    if (entry === undefined) {
+      entry = {
+        key,
+        year: Number(key.slice(0, 4)),
+        month: Number(key.slice(5, 7)),
+        cost: 0, prompt: 0, cacheHit: 0, cacheMiss: 0, response: 0, requests: 0, activeDays: 0,
+      }
+      byKey.set(key, entry)
+    }
+    entry.cost += day.cost
+    entry.prompt += day.prompt ?? 0
+    entry.cacheHit += day.cacheHit
+    entry.cacheMiss += day.cacheMiss
+    entry.response += day.response
+    entry.requests += day.requests
+    if (day.cost > 0) entry.activeDays += 1
+  }
+  return [...byKey.values()].sort((left, right) => left.key.localeCompare(right.key))
+}
+
+/**
  * Convert one month into the timestamp window the per-key endpoints expect.
- * The month is cut on UTC boundaries: the console's own `usage/amount` rows are
- * UTC days too, so both sources place the same day in the same month.
+ * Mirrors the console's own helper: the month is cut on the viewer's local day
+ * boundaries, and the offset is split into whole hours plus a remainder that is
+ * folded into the range, so the buckets land on local midnights.
  * @param year - four-digit year.
  * @param month - 1-based month.
- * @returns start/end seconds and a zero offset.
+ * @returns start/end seconds and the whole-hour offset in seconds.
  */
 function monthWindow(year, month) {
+  const start = new Date(year, month - 1, 1)
+  const end = new Date(year, month, 1)
+  const offset = -start.getTimezoneOffset() * 60
+  const whole = 3600 * Math.floor(offset / 3600)
+  const rest = offset - whole
   return {
-    startSec: Date.UTC(year, month - 1, 1) / 1000,
-    endSec: Date.UTC(year, month, 1) / 1000,
-    tzSec: 0,
+    startSec: Math.floor(start.getTime() / 1000) + rest,
+    endSec: Math.floor(end.getTime() / 1000) + rest,
+    tzSec: whole,
   }
 }
 
@@ -480,6 +516,10 @@ async function collectGroups(session, months) {
       addDay(entry.days, row)
     }
   }
+  // The console cuts these buckets on local midnights, so this daily total is the
+  // one source the whole snapshot is derived from.
+  const allDays = new Map()
+  for (const row of rows.values()) addDay(allDays, row)
   const sorted = (days) => [...days.values()].sort((left, right) => left.date.localeCompare(right.date))
   return {
     models: [...byModel].map(([name, days]) => ({ name, daily: sorted(days) })),
@@ -488,6 +528,7 @@ async function collectGroups(session, months) {
       name: entry.name,
       daily: sorted(entry.days),
     })),
+    days: sorted(allDays),
   }
 }
 
@@ -502,18 +543,22 @@ async function buildSnapshot(session) {
   // The walk ends only after three empty months, so it can start before the
   // account's first spend. History starts at the first month that spent money.
   const firstWithSpend = collected.findIndex(month => month.totals.cost > 0)
-  const months = firstWithSpend > 0 ? collected.slice(firstWithSpend) : collected
-  const daily = buildDailySeries(months)
-  const dailyTotal = daily.reduce((sum, day) => sum + day.cost, 0)
-  const lifetimeSpend = lifetime === null ? dailyTotal : lifetime.amount
-  const monthsWithSpend = months.filter(month => month.totals.cost > 0).length
+  const range = firstWithSpend > 0 ? collected.slice(firstWithSpend) : collected
   // Group data is a bonus view: a failure there must not sink the main snapshot.
-  let groups = { models: [], keys: [] }
+  let groups = { models: [], keys: [], days: [] }
   try {
-    groups = await collectGroups(session, months)
+    groups = await collectGroups(session, range)
   } catch {
     // Keep the ungrouped snapshot usable when the per-key endpoint misbehaves.
   }
+  // The per-key endpoint is the only source the console cuts on the viewer's own
+  // midnights, so the daily series and the month totals both derive from it.
+  const firstMonthKey = range.length > 0 ? range[0].key : null
+  const daily = firstMonthKey === null ? [] : buildDailySeries(groups.days, firstMonthKey)
+  const months = aggregateMonths(daily)
+  const dailyTotal = daily.reduce((sum, day) => sum + day.cost, 0)
+  const lifetimeSpend = lifetime === null ? dailyTotal : lifetime.amount
+  const monthsWithSpend = months.filter(month => month.cost > 0).length
   return {
     ok: true,
     currency: lifetime === null ? 'CNY' : lifetime.currency,
@@ -525,18 +570,7 @@ async function buildSnapshot(session) {
     activeDays: daily.filter(day => day.cost > 0).length,
     recordedMonths: months.length,
     monthsWithSpend,
-    months: months.map(month => ({
-      key: month.key,
-      year: month.year,
-      month: month.month,
-      cost: month.totals.cost,
-      prompt: month.totals.prompt,
-      cacheHit: month.totals.cacheHit,
-      cacheMiss: month.totals.cacheMiss,
-      response: month.totals.response,
-      requests: month.totals.requests,
-      activeDays: month.activeDays,
-    })),
+    months,
     daily,
     groups,
     generatedAt: new Date().toISOString(),

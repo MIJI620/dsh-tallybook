@@ -238,7 +238,8 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Format an ISO timestamp as a local `MM-DD HH:mm` clock reading.
+     * Format an ISO timestamp as a local `MM-DD HH:mm` clock reading, the same
+     * calendar the Platform shows its usage in.
      * @param iso - ISO timestamp.
      * @returns the formatted time, or an empty string when absent.
      */
@@ -263,7 +264,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The browser's own date as `YYYY-MM-DD`, used to name exported files.
+     * The local date as `YYYY-MM-DD`, used to name exported files.
      * @returns the date key.
      */
     function todayKey() {
